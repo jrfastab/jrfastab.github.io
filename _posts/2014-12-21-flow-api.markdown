@@ -1,0 +1,803 @@
+---
+layout: post
+title:  "Tutorial: Modelling and Configuring Hardware Flow Tables with Linux"
+date:   2014-12-21 12:10:02
+categories: jekyll update
+---
+<h2> Introduction </h2>
+
+The flow API provides a mechanism to expose a model of the devices packet
+processing pipeline and an interface to configure the device. The API
+is flexible enough to express many different hardware configurations and
+packet formats in a common API.
+
+Linux can support many devices with wildly different capabilities from
+host NICs with only basic filtering functions up to full fledged silicon
+ASICs. We expect this API can support many of these devices and have
+implemented the API on Rocker switch.
+
+When using the API the general flow should be, (a) query the device
+to learn what headers it supports, (b) query the device to learn what
+actions it can perform on these headers, (c) query the device learn
+what tables it has and what headers/actions each table supports. Then
+the user space application or kernel consumer can configure the device
+to match its requirements. The application may find the device does not
+support every match/action it wants to perform. Dealing with this
+"impedance" mismatch is not covered by the API yet. We plan to address
+this in future work.
+
+The examples below use a user space tool denoted 'flow' which exists on
+github at,
+
+    https://github.com/jrfastab/iproute2-flow-tool
+
+The tool is a new tool that we may possibly try to merge with iproute2
+package at some point. The rational being the iproute2 package already
+consists of many Linux networking tools.
+
+The kernel has been modified with a set of patches to consume the new
+netlink API and also enable the rocker driver to support this model
+it can be found here,
+
+    https://github.com/jrfastab/rocker
+
+A more experimental branch exists on its own tree here but without any
+support for rocker. I recommend using the above for this tutorial but
+if you want to see/explore where we might be headed try this tree,
+
+    https://github.com/jrfastab/flow-net-next
+
+The API is built on top of the Netlink infrastructure and uses a new
+netlink family.
+
+The rocker switch we enabled requires an updated qemu that is posted
+at,
+
+    https://github.com/scottfeldman/qemu-rocker
+
+There is a README file that explains how to install qemu for rocker
+support.
+
+This tutorial is an attempt to introduce the Flow API and walk through
+the various pieces both users and developers may find interesting. The
+examples use the code repositories above. The easiest way to explore
+the API (for me at least) is to walk through the above (a) - (c) below
+under "Capabilities", followed by a session showing configuration, and
+finally some remarks on the infrastructure and comments.
+
+I should say much of this work has been based of previous work
+such as P4 (p4.org), ForCES (IETF), OVS (openvswitch.org), and many
+others.
+
+<h2> Capabilities </h2>
+
+The Flow API is built to expose a pipeline model based on tables of
+the device. We model a set of tables arranged in a graph with packets
+being sent through the graph. Each table supports a set of matches
+and a set of actions.
+
+The Flow API provides an interface to query each of these. Using
+Netlink messages.
+
+<h1> Message Format </h1>
+
+The message format consists of nested attributes for the capabilities
+used to describe the pipeline. The two key values used to look up the
+device are [NET_FLOW_TABLE_IDENTIFIER_TYPE] and [NET_FLOW_TABLE_IDENTIFIER].
+We added a specific attribute to give the identifier type to handle
+different types of keys. At the moment the only key supported is the
+ifindex value of the net device to configure. In the future we may
+support switch device type or silicon that does not expose any net devices.
+
+{% highlight c %}
+[NET_FLOW_TABLE_IDENTIFIER_TYPE]
+[NET_FLOW_TABLE_IDENTIFIER]
+[NET_FLOW_HEADERS]
+[NET_FLOW_ACTIONS]
+[NET_FLOW_TABLES]
+[NET_FLOW_HEADER_GRAPH]
+[NET_FLOW_TABLE_GRAPH]
+{% endhighlight %}
+
+The attributes are defined as follows,
+
+    NET_FLOW_HEADERS: Gives a list of all headers the device can parse.
+                      For example this may define an ethernet header,
+                      a VLAN header or even a special non-standard foo
+                      header the device knows about. Each header is define
+                      using a bitwidth layout.
+
+    NET_FLOW_ACTIONS: Gives a list of supported actions and the arguments
+                      the actions take.
+
+    NET_FLOW_TABLES: Gives a list of tables and each tables supported
+                     matches and actions. Along with table attributes
+                     for example the size of the table.
+
+    NET_FLOW_HEADER_GRAPH: In addition to reporting just the headers the
+                           device can parse it is also important to know
+                           what orders headers may appear in. For example
+                           some devices can support Q'in'Q others can not.
+                           Still others may support parsing TCP after VXLAN
+                           other only after GRE, etc.
+
+    NET_FLOW_TABLE_GRAPH: Gives a graph showing how tables may be traversed
+                          along with how the packet traversal may be chosen.
+                          Taking OVS as an example we would report a fully
+                          connected graph with packet traversal determinded
+                          by the goto_table metadata field. With the default
+                          being a linear traversal.
+
+These attributes appear sufficient to describe a reasonable set of devices.
+One of the advantages of using Netlink (a TLV formatted protocol) is we can
+extend the attribute if/when we determine we need to.
+
+<h1> Headers </h1>
+
+The headers attribute is used to describe the set of headers supported by the
+device. Devices wanting to support this attribute need to implement the net
+device op,
+
+{% highlight c %}
+    struct net_flow_header  **(*ndo_flow_get_headers)(struct net_device *dev);
+{% endhighlight %}
+
+Which provides a list of pointers to header types. This is not required to
+be static but at the moment the rocker switch only supports a single set of
+headers defined in ./drivers/net/ethernet/rocker/rocker_pipeline.h
+
+{% highlight c %}
+struct net_flow_header *rocker_header_list[] =
+{
+	&ethernet,
+	&vlan,
+	&ipv4,
+	&metadata_t,
+	&null_hdr,
+};
+{% endhighlight %}
+
+Lets examine the vlan header,
+
+{% highlight c %}
+#define HEADER_VLAN 2
+struct net_flow_header vlan = {
+	.name = "vlan",
+	.uid = HEADER_VLAN,
+	.field_sz = 4,
+	.fields = vlan_fields,
+};
+{% endhighlight %}
+
+A header consists of a name which is a human readable string. This is not
+used by any logic but merely helps users identify the header. The UID must
+be unique to the device. Finally a list of fields is supplied,
+
+{% highlight c %}
+#define HEADER_VLAN_PCP 1
+#define HEADER_VLAN_CFI 2
+#define HEADER_VLAN_VID 3
+#define HEADER_VLAN_ETHERTYPE 4
+struct net_flow_field vlan_fields[4] = {
+	{ .name = "pcp", .uid = HEADER_VLAN_PCP, .bitwidth = 3,},
+	{ .name = "cfi", .uid = HEADER_VLAN_CFI, .bitwidth = 1,},
+	{ .name = "vid", .uid = HEADER_VLAN_VID, .bitwidth = 12,},
+	{ .name = "ethertype", .uid = HEADER_VLAN_ETHERTYPE, .bitwidth = 16,},
+};
+{% endhighlight %}
+
+The field list provides the fields in the header and the bitwidth of the
+fields. From this structure we can construct a the packet format. Notice
+the similarlities to P4.
+
+The logic in flow_table.c will encode this in a netlink message and send it
+to the initiator of the message. The message format looks like this,
+
+{% highlight c %}
+  [NET_FLOW_TABLE_HEADERS]
+    [NET_FLOW_HEADER]                   /* NEST */
+ 	  [NET_FLOW_HEADER_ATTR_NAME]       /* STRING */
+ 	  [NET_FLOW_HEADER_ATTR_UID]        /* U32 */
+ 	  [NET_FLOW_HEADER_ATTR_FIELDS]     /* NEST */
+ 	    [NET_FLOW_HEADER_ATTR_FIELD]    /* NEST */
+ 	      [NET_FLOW_FIELD_ATTR_NAME]    /* STRING */
+ 	      [NET_FLOW_FIELD_ATTR_UID]     /* U32 */
+ 	      [NET_FLOW_FIELD_ATTR_BITWIDTH] /* U32 */
+ 	    [NET_FLOW_HEADER_ATTR_FIELD]    /* NEST */
+ 	      [...]
+ 	    [...]
+    [NET_FLOW_HEADER]                   /* NEST */
+       [...]
+   [...]
+{% endhighlight %}
+
+The flow tool referenced in the introduction can query a device for this
+information and print it to the screen.
+
+{% highlight c %}
+#flow -i eth1 get_headers
+  ethernet {
+	 src_mac:48  dst_mac:48  ethertype:16 
+	 }
+  vlan {
+	 pcp:3  cfi:1  vid:12  ethertype:16 
+	 }
+  ipv4 {
+	 version:4  ihl:4  dscp:6  ecn:2  length:8  identification:8  
+	 flags:3  fragment_offset:13  ttl:1  protocol:8  csum:8  
+	 src_ip:32  dst_ip:32  options:* 
+	 }
+  metadata_t {
+	 in_lport:32  l3_unicast_group_id:32  l2_rewrite_group_id:32  l2_group_id:32 
+	 }
+{% endhighlight %}
+
+Here we can see the rocker switch which is behind "eth1" supports ethernet,
+vlan, and ipv4. Then a set of metadata_t values. Metadata are set by the switch
+after receiving a packet see in_lport for an example of this. Also there is
+metadata that can be set via actions (discussed below). The metadata might
+be used to determine packet flow for example. In the rocker switch we have
+l3_unicast_group_id, l2_rewrite_group_id and l2_group_id. These can be set
+using a corresponding actions and then latter in the pipeline matched on.
+
+User space can infer the meaning of some metadata fields by looking at
+the packet processing pipeline. In the above example the last 3 group fields
+can be inferred because they are only ever set by reported actions. However
+another class of metadata is either set before the packet processing pipeline
+is entered or is used outside the packet processing pipeline. In both these
+cases the metadata and specifically its use needs to be "known". In the above
+example in_lport specifies the ingress logical port the packet was received on.
+There is no way to learn this from the flow API so some set of metadata must be
+standardized across devices. This is not ideal but I don't think it can be
+resolved.
+
+The next piece is to understand how headers are related. This is important to
+learn what is supported by the device, 'rocker' in its current state will support
+a single 802.1Q VLAN headers but not more than one. If we did not have a mechanism
+to report this our appications could erroneously expect the hardware to match IP
+packets with multiple VLAN tags.
+
+For this devices need to implement the ndo op,
+
+{% highlight c %}
+    struct net_flow_hdr_node **(*ndo_flow_get_hdr_graph)(struct net_device *dev);
+{% endhighlight %}
+
+this returns a set of nodes and edges that build a graph describing how headers
+are related. Again we can look at rocker_pipeline.h as an example,
+
+{% highlight c %}
+struct net_flow_jump_table parse_vlan[2] =
+{
+	{
+		.field = {
+		   .header = HEADER_VLAN,
+		   .field = HEADER_VLAN_ETHERTYPE,
+		   .type = NET_FLOW_FIELD_REF_ATTR_TYPE_U16,
+		   .value_u16 = 0x0800,
+		},
+		.node = HEADER_INSTANCE_IPV4,
+	},
+	{
+		.field = {0},
+		.node = 0,
+	},
+};
+
+int vlan_headers[2] = {HEADER_VLAN, 0};
+struct net_flow_hdr_node vlan_header_node = {
+	.name = "vlan",
+	.uid = HEADER_INSTANCE_VLAN_OUTER,
+	.hdrs = vlan_headers,
+	.jump = parse_vlan,
+};
+{% endhighlight %}
+
+Each node has a user friendly string name a unique id, the header it is parsing
+and the jump table. We need to have a unique identifier here which we refer to
+as an "instance" to identify which header we are referencing when we may have
+multiple stacked headers. In the above example we see
+'HEADER_INSTANCE_VLAN_OUTER' however there may also be
+a 'HEADER_INSTANCE_VLAN_INNER' used to represent the inner VLAN header if we
+have two stacked VLANs.
+
+The jump table, in the above example 'parse_vlan', is a null terminated
+array of next nodes. The field and value_u16 values are used here to determine
+the next node. As we may know the ethertype for IPv4 is 0x800 so the next node
+is the IPv4 header. Non-exact matches may also be supported by supplying a mask
+field to match multiple entries. If no next node is found we expect that no
+further headers will be used. Returning to our multiple stacked VLAN header
+example above we can see the Rocker pipeline would abort processing headers
+if the VLAN header does not have an ethertype of 0x0800 corresponding to IPv4.
+
+The entire graph can be returned in text via
+
+{% highlight c %}
+#flow -i eth1 get_header_graph
+{% endhighlight %}
+
+I however find this a bit tedious to read so we can print it in 'dot' format
+which is easy to graph using graphing tools by adding the '-g' option,
+
+{% highlight c %}
+#flow -g -i eth1 get_header_graph
+{% endhighlight %}
+
+Shown here printed using the graphviz toolset,
+
+<img src="/assets/rocker_headers.gif">
+
+Metadata values which are not part of the actual parsed packet are shown here
+but not included in the parse graph. We model metadata as fields so that they
+can be matched on and actions can reference them with out using additional
+mechanisms. It seems to work reasonable well.
+
+This completes the headers attributes and graphs. Next we will want to query
+the device to learn the actions supported on these packets.
+
+<h1> Actions </h1>
+
+Devices report the set of actions they support by implementing the correct
+ndo op, 
+
+{% highlight c %}
+    struct net_flow_action  **(*ndo_flow_get_actions)(struct net_device *dev);
+{% endhighlight %}
+
+And then just like before we can review an example in rocker_pipeline.h. 
+
+{% highlight c %}
+struct net_flow_action *rocker_action_list[10] = 
+{ 
+    &set_vlan_id, 
+    &copy_to_cpu, 
+    &set_l3_unicast_group_id,    
+    &set_l2_rewrite_group_id,    
+    &set_l2_group_id,    
+    &pop_vlan, 
+    &set_eth_src, 
+    &set_eth_dst, 
+    &check_ttl_drop, 
+    &null_action, 
+};
+{% endhighlight %}
+
+This is the structure returned by rocker_pipeline.h to the get_actions operation.
+Each of the specified operations is defined further in the pipeline model providing
+a user visible string, a unique identifier for the action, and description of the
+arguments it takes. In this way a device can support arbitrary actions for the user
+to use and provide the semantics arguments. Take a look at 'set_l3_unicast_group_id',
+
+{% highlight c %}
+struct net_flow_action_arg set_group_id_args[2] = {
+    {
+        .name = "group_id",
+        .type = NET_FLOW_ACTION_ARG_TYPE_U32,
+        .value_u32 = 0,
+    },
+    {
+        .name = "",
+        .type = NET_FLOW_ACTION_ARG_TYPE_NULL,
+    },
+};
+{% endhighlight %}
+
+{% highlight c %}
+#define ACTION_SET_L3_UNICAST_GROUP_ID 3
+struct net_flow_action set_l3_unicast_group_id = {
+    .name = "set_l3_unicast_group_id",
+    .uid = ACTION_SET_L3_UNICAST_GROUP_ID,
+    .args = set_group_id_args,
+};
+{% endhighlight %}
+
+Here the user name string is supplied along with the uid and arguments.  The
+arguments specified is a U32 value called "group_id". The argument list is a null
+terminated array and may contain multiple arguments each with its own type. In
+the example above only a single argument is used.
+
+You may have noticed something here. Although this gives us a list of actions
+we can perform on a packet and a set of argument to give the action so we can
+use them it does not supply the operations performed on the packet. Many of
+the actions in rocker switch should be clear from the user friendly name. We
+would expect "set_eth_src" for example to set the ethernet source address and
+similiarly "set_eth_dst" to set the ethernet destination address. Also
+'copy_to_cpu' most likely copies the packet to the CPU port. Although this is
+perhaps passable for human consumers of the API it makes it challanging to
+programatically interface with the API. For now we rely on some basic naming
+conventions such as _set_{field_name} indicates an action is going to set the
+field value or _pop_{field_name} will pop the tag of the packet. Subsequent
+work is being done to make the operations an action performs more explicit.
+See remarks section at end for more details.
+
+Users can query the device using the command line tool flow as shown here,
+
+{% highlight c %}
+#flow -i eth1 get_actions 
+	   1: set_vlan_id ( u16 vlan_id )
+	   2: copy_to_cpu (  )
+	   3: set_l3_unicast_group_id ( u32 group_id )
+	   4: set_l2_rewrite_group_id ( u32 group_id )
+	   5: set_l2_group_id ( u32 group_id )
+	   6: pop_vlan (  )
+	   7: set_eth_src ( u64 eth_src )
+	   8: set_eth_dst ( u64 eth_dst )
+	   10: check_ttl_drop (  )
+{% endhighlight %}
+
+With these three commands get_actions, get_headers and get_headers_graph
+a user can learn what types of actions and headers are supported by the
+packet processing pipeline. Whats left is to determine how many tables
+are supported? What order are the tables traversed? What match actions does
+each specific table support?
+
+<section markdown="1">
+
+<h1> Tables </h1>
+
+To describe the pipeline we use a set of tables that report the actions
+and headers they support. Here is an example from the rocker switch,
+
+{% highlight c %}
+#flow -i eth1 get_tables
+ingress_port:1 src 1 apply 1 size -1
+  matches:
+	 field: in_lport [in_lport (lpm)]
+  actions:
+
+vlan:2 src 1 apply 2 size -1
+  MATCHES:
+	 field: in_lport [in_lport (lpm)]
+	 field: vlan [vid (lpm)]
+  actions:
+	   1: set_vlan_id ( u16 vlan_id 0  )
+
+term_mac:3 src 1 apply 3 size -1
+  matches:
+	 field: in_lport [in_lport (lpm)]
+	 field: ethernet [ethertype (exact) dst_mac (lpm)]
+	 field: vlan [vid (lpm)]
+  actions:
+	   2: copy_to_cpu (  )
+
+ucast_routing:4 src 1 apply 4 size -1
+  matches:
+	 field: ethernet [ethertype (exact)]
+	 field: ipv4 [dst_ip (lpm)]
+  actions:
+	   3: set_l3_unicast_group_id ( u32 group_id 0  )
+
+bridge:6 src 1 apply 6 size -1
+  matches:
+	 field: ethernet [dst_mac (lpm)]
+	 field: vlan [vid (lpm)]
+  actions:
+	   5: set_l2_group_id ( u32 group_id 0  )
+	   2: copy_to_cpu (  )
+
+acl:7 src 1 apply 7 size -1
+  matches:
+	 field: in_lport [in_lport (lpm)]
+	 field: ethernet [src_mac (lpm) dst_mac (lpm) ethertype (exact)]
+	 field: vlan [vid (lpm)]
+	 field: ipv4 [protocol (lpm) dscp (lpm)]
+  actions:
+	   3: set_l3_unicast_group_id ( u32 group_id 0  )
+
+group_slice_l3_unicast:8 src 1 apply 8 size -1
+  matches:
+	 field: l3_uniscast_group_id [l3_unicast_group_id (exact)]
+  actions:
+	   7: set_eth_src ( u64 eth_src 0  )
+	   8: set_eth_dst ( u64 eth_dst 0  )
+	   1: set_vlan_id ( u16 vlan_id 0  )
+	   4: set_l2_rewrite_group_id ( u32 group_id 0  )
+	   10: check_ttl_drop (  )
+
+group_slice_l2_rewrite:9 src 1 apply 9 size -1
+  matches:
+	 field: l2_rewrite_group_id [l2_rewrite_group_id (exact)]
+  actions:
+	   7: set_eth_src ( u64 eth_src 0  )
+	   8: set_eth_dst ( u64 eth_dst 0  )
+	   1: set_vlan_id ( u16 vlan_id 0  )
+	   5: set_l2_group_id ( u32 group_id 0  )
+
+group_slice_l2:10 src 1 apply 10 size -1
+  matches:
+	 field: l2_group_id [l2_group_id (exact)]
+  actions:
+	   6: pop_vlan (  )
+{% endhighlight %}
+
+In its entirety rocker is currently being modeled with 12 different tables.
+Let look at one,
+
+{% highlight c %}
+ucast_routing:4 src 1 apply 0 size -1
+  matches:
+	 field: ethernet [ethertype (exact)]
+	 field: ipv4 [dst_ip (lpm)]
+  actions:
+	   3: set_l3_unicast_group_id ( u32 group_id 0  )
+{% endhighlight %}
+
+In this table the first line shows some table attributes. The name
+'ucast_routing' this is human readable string it is not used in any logic.
+There is a 'src' attribute used to define how tables are partition physical
+hardware resources. This is used with the DYNAMIC table flag. When a table
+has the DYNAMIC flag set we can use create/destroy operations to sub-divide
+the table space. In the current rocker model this is not supported. In a
+follow on tutorial we will discuss the dynamic table usage in depth.
+
+The apply field is used to indicate when actions are applied. In rocker
+switch actions for each table are applied at the egress of each table. Or
+at least this is how the model works and the underlying driver ensures any
+rules can rely on this behavior. We can "learn" this from the above output
+by looking the 'apply' field. All actions in the same apply group will be
+applied at one time. So if a packet traverses a set of tables all in the
+same apply group any actions will only be applied once the table leaves that
+apply group. We will show some examples of this in a follow up tutorial
+as well.
+
+The above table description reported by the 'get_tables' command gives a
+description of each table but does not show how packets traverse the tables.
+To learn this traversal users can run,
+
+{% highlight c %}
+#flow -i eth1 get_graph
+{% endhighlight %}
+
+This will show a text output giving the edges and nodes describing how
+packets get sent through the above tables. Each node will represent a
+table from the 'get_tables' command and each edge a criteria that has
+a qualifier to determine if a packet will follow this edge. A qualifier
+will typically be a field match and mask. For example a typical edge
+might be qualified with 'ethernet.ethertype = 0x0800' to indicate all
+IPv4 traffic should be sent over this edge. The tool will attempt to make
+the output as readable as possible and may substitute well known values
+with their string equivelent. It may for example replace a field+mask with
+unicast or multicast if it is well known.
+
+As above to get the graphical version which is easier to read add the
+'-g' option,
+
+{% highlight c %}
+#flow -g -i eth1 get_graph
+{% endhighlight %}
+
+<img src="/assets/rocker_tables.gif">
+
+For the driver developer tables and table graphs are supported by implementing
+the following two ndo operations,
+
+{% highlight c %}
+struct net_flow_table   **(*ndo_flow_get_tables)(struct net_device *dev);
+struct net_flow_tbl_node **(*ndo_flow_get_tbl_graph)(struct net_device *dev)
+{% endhighlight %}
+
+The table structure is defined in include/linux/if_flow.h as,
+
+{% highlight c %}
+/**
+ * @struct net_flow_table
+ * @brief define flow table with supported match/actions
+ *
+ * @uid unique identifier for table
+ * @source uid of parent table
+ * @size max number of entries for table or -1 for unbounded
+ * @matches null terminated set of supported match types given by match uid
+ * @actions null terminated set of supported action types given by action uid
+ * @flows set of flows
+ */
+struct net_flow_table {
+	char name[NET_FLOW_NAMSIZ];
+	int uid;
+	int source;
+	int apply_action;
+	int size;
+	struct net_flow_field_ref *matches;
+	int *actions;
+};
+{% endhighlight %}
+
+Here each of these fields corresponds with the fields listed in the output
+from the flow tool. Both matches and actions are null terminated arrays of
+matches or actions. Each are referenced by their unique id which can be seen
+in the output from the 'get_actions' and 'get_headers' commands.
+
+The netlink format is similarly sensible.
+
+{% highlight c %}
+enum {
+	NET_FLOW_TABLE_ATTR_UNSPEC,
+	NET_FLOW_TABLE_ATTR_NAME,
+	NET_FLOW_TABLE_ATTR_UID,
+	NET_FLOW_TABLE_ATTR_SOURCE,
+	NET_FLOW_TABLE_ATTR_APPLY,
+	NET_FLOW_TABLE_ATTR_SIZE,
+	NET_FLOW_TABLE_ATTR_MATCHES,
+	NET_FLOW_TABLE_ATTR_ACTIONS,
+	__NET_FLOW_TABLE_ATTR_MAX,
+};
+#define NET_FLOW_TABLE_ATTR_MAX (__NET_FLOW_TABLE_ATTR_MAX - 1)
+{% endhighlight %}
+
+Where hopefully the mapping from the structure to the attribute list is
+obvious. Here 'NET_FLOW_TABLE_ATTR_MATCHES' and 'NET_FLOW_TABLE_ATTR_ACTIONS'
+are nested attributes.
+
+</section>
+
+<h2> Configuration </h2>
+
+<h1> Flows </h1>
+
+With the capabilities built up we can now add match/action rules to the
+tables. This is done using a netlink encoding of the net_flow_field_ref
+structure.
+
+{% highlight c %}
+/**
+ * @struct net_flow_field_ref
+ * @brief uniquely identify field as header:field tuple
+ */
+struct net_flow_field_ref {
+	int instance;
+	int header;
+	int field;
+	int mask_type;
+	int type;
+	union {
+		__u8 value_u8;
+		__u16 value_u16;
+		__u32 value_u32;
+		__u64 value_u64;
+	};
+	union {
+		__u8 mask_u8;
+		__u16 mask_u16;
+		__u32 mask_u32;
+		__u64 mask_u64;
+	};
+};
+{% endhighlight %}
+
+A flow match is uniquely defined by the instance, header, and field identifiers.This
+maps to the 'get_headers' command above. The mask_type specifies the mask being
+used. Currently supported are 'exact', 'lpm' (least prefix match), and 'mask'.
+Exact match types do not specify a mask_u# value. And if they do it is ignored.
+for 'lpm' and 'mask' types a mask_u# must be specified which matches the
+'type'.
+
+{% highlight c %}
+enum {
+	NET_FLOW_MASK_TYPE_UNSPEC,
+	NET_FLOW_MASK_TYPE_EXACT,
+    NET_FLOW_MASK_TYPE_LPM,
+    NET_FLOW_MASK_TYPE_MASK,
+};
+{% endhighlight %}
+
+Currently the flow API supports a limited set of types that seems
+sufficient to work with most header types.
+
+{% highlight c %}
+enum {
+	NET_FLOW_FIELD_REF_ATTR_TYPE_UNSPEC,
+	NET_FLOW_FIELD_REF_ATTR_TYPE_U8,
+	NET_FLOW_FIELD_REF_ATTR_TYPE_U16,
+	NET_FLOW_FIELD_REF_ATTR_TYPE_U32,
+	NET_FLOW_FIELD_REF_ATTR_TYPE_U64,
+};
+{% endhighlight %}
+
+However the messaging and API is designed to allow for this to be extended. If
+it is discovered that more types would be useful then we can define additional
+types.
+
+The drivers support adding and removing flows by implementing the ndo
+operations,
+
+{% highlight c %}
+#./include/linux/netdevice.h 
+	int		        (*ndo_flow_get_flows)(struct sk_buff *skb,
+						      struct net_device *dev,
+						      int table, int min, int max);
+	int		        (*ndo_flow_set_flows)(struct net_device *dev,
+						      struct net_flow_flow *f);
+	int		        (*ndo_flow_del_flows)(struct net_device *dev,
+						      struct net_flow_flow *f);
+{% endhighlight %}
+
+It might be worth calling attention to the 'ndo_flow_get_flows' operatoins.
+This passes the skb as an argument. Drivers should use,
+
+{% highlight c %}
+     net_flow_put_flow(skb, &flow);
+{% endhighlight %}
+
+to populate the skb. Populating it directly with nla_xyz calls should be
+discouraged.
+
+Using the flow command tool to set flows the 'set_flow' sub-command should
+be used as shown below. In this examples we dump all traffic with an ethertype
+0x0800 to the cpu from ingress port 1 and vlan id 10. And also set the VLAN
+ID to 10 on ingress traffic of port 10. The tool syntax input and output could
+use some work but hopefully this shows the usefulness of the API.
+
+{% highlight c %}
+#flow  -i eth1 set_flow prio 1 handle 4 table 3 \
+    match ethernet.ethertype 0x0800 0xffff \
+    match in_lport.in_lport 1 0xffffffff   \
+    match vlan.vid 10 0xffff               \
+    action copy_to_cpu
+
+table : 3  uid : 4  prio : 1
+	 ethernet.ethertype = 0800 (ffff)
+	 metadata_t.in_lport = 00000001 (ffffffff)
+	 vlan.vid = 000a (ffff)
+	   2: copy_to_cpu (  )
+{% endhighlight %}
+
+{% highlight c %}
+#flow  -i eth1 set_flow prio 1 handle 4 table 2 \
+    match in_lport.in_lport 1 0xffffffff
+    action set_vlan_id 10
+
+table : 2  uid : 4  prio : 1
+	 metadata_t.in_lport = 00000001 (ffffffff)
+	   1: set_vlan_id ( u16 vlan_id 10  )
+{% endhighlight %}
+
+Then the flows can be queried for the table using this command
+
+{% highlight c %}
+#flow -g -i eth1 get_flows 3
+table : 3  uid : 1  prio : 0
+	 metadata_t.in_lport = 00000001 (00000001)
+	 ethernet.ethertype = 0800 (0000)
+	 ethernet.dst_mac = 52:54:00:12:35:01 (52:54:00:12:35:01)
+	 vlan.vid = 000a (ffff)
+	   2: copy_to_cpu (  )
+{% endhighlight %}
+
+{% highlight c %}
+#flow -g -i eth1 get_flows 2
+table : 2  uid : 1  prio : 1
+	 metadata_t.in_lport = 00000001 (00000000)
+	 vlan.vid = 0100 (0000)
+	   1: set_vlan_id ( u16  10  )
+{% endhighlight %}
+
+In the next tutorial we will show a slightly more interesting example 
+that utilizes more tables and does something "useful".
+
+<h1> Tables </h1>
+
+Tables can also be created and destroy with the following sub-commands 'create'
+and 'destroy'. However rocker switch does not currently support this yet so we
+will demonstrate this in a future tutorial.
+
+<h2> Next </h2>
+
+What's up next...
+
+The next useful thing to do is build a more interesting example with multiple
+switches each with multiple ports. We can tackle some more interesting use
+examples such as MAC/IP rewriting, drop packets, etc.
+
+Additionally we still need to address the ability to create and destroy tables
+in the API which hopefully should be a short tutorial on its own. Rocker does
+not currently support this but a test tool flowd emulates hardware in user space
+and does have support for it. Also we have plans to add additional "worlds" to
+rocker to support dynamic table creation. This work is TBD.
+
+Then the next topic is mapping models onto the hardware model. This is useful when 
+software wants to work with a single model across multiple hardware devices.
+
+Thanks and hopefully this was helpful.
+
+[jekyll]:      http://jekyllrb.com
+[jekyll-gh]:   https://github.com/jekyll/jekyll
+[jekyll-help]: https://github.com/jekyll/jekyll-help

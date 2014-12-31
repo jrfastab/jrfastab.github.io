@@ -1,0 +1,10 @@
+# Site settings
+title: Assorted Notes 
+email: john.fastabend@gmail.com
+description: Assorted notes, comments, and experiments # this means to ignore newlines until "baseurl:"
+baseurl: "" # the subpath of your site, e.g. /blog/
+url: "http://github.com/jrfastab/" # the base hostname & protocol for your site
+github_username:  jrfastab
+
+# Build settings
+markdown: kramdown

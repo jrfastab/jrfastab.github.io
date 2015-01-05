@@ -9,10 +9,10 @@ categories: jekyll update
 The flow API provides a mechanism to expose a model of the devices packet
 processing pipeline and an interface to configure the device. The API
 is flexible enough to express many different hardware configurations and
-packet formats in a common API.
+packet formats.
 
 Linux can support many devices with wildly different capabilities from
-host NICs with only basic filtering functions up to full fledged silicon
+host NICs with only basic filtering functions up to full fledged switch
 ASICs. We expect this API can support many of these devices and have
 implemented the API on Rocker switch.
 
@@ -24,7 +24,9 @@ the user space application or kernel consumer can configure the device
 to match its requirements. The application may find the device does not
 support every match/action it wants to perform. Dealing with this
 "impedance" mismatch is not covered by the API yet. We plan to address
-this in future work.
+this in future work. In general this is best dealt with in
+userspace where the user can make policy decisions. We will explore
+this further later.
 
 The examples below use a user space tool denoted 'flow' which exists on
 github at,
@@ -665,12 +667,28 @@ struct net_flow_field_ref {
 
 A flow match is uniquely defined by the instance, header, and field identifiers.This
 maps to the 'get_headers' command above. The mask_type specifies the mask being
-used. Currently supported are 'exact', 'lpm' (least prefix match), and 'mask'.
+used. Currently supported are 'exact', 'lpm' (longest prefix match), and 'mask'.
 Exact match types do not specify a mask_u# value. And if they do it is ignored.
 for 'lpm' and 'mask' types a mask_u# must be specified which matches the
-'type'.
+'type'. LPM masks _must_ be a bitmask with 1's followed by 0 for example
+a valid LPM mask might be (given in hex)
 
 {% highlight c %}
+    mask_u16 = ff80
+{% endhighlight %}
+
+An invalid LPM mask would mix 1's and 0's an invalid mask is given below in
+binary.
+
+{% highlight c %}
+    mask_u16 = b1101 0011 1111 1111
+{% endhighlight %}
+
+This would however be a valid NET_FLOW_MASK_TYPE_MASK value. The enumeration of
+the types is below and may be extended as needed
+
+{% highlight c %}
+#./include/uapi/linux/if_flow.h
 enum {
 	NET_FLOW_MASK_TYPE_UNSPEC,
 	NET_FLOW_MASK_TYPE_EXACT,
